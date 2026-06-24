@@ -19,6 +19,9 @@ public:
         double threshold   = 30.0;
         int    morph_ksize = 5;
         int    min_area    = 50;
+        // Phase 3: page-locked(pinned) 호스트 메모리 + async 전송 사용 여부.
+        // false면 Phase 2의 pageable 동기 cudaMemcpy 경로(before/after 비교용).
+        bool   pinned      = true;
     };
 
     CudaDefectDetector();

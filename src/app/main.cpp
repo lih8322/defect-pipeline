@@ -16,7 +16,7 @@
 
 // 사용법:
 //   ./defect_pipeline <mvtec_category_root> [detector] [loop_count] [out_csv]
-//     detector: cpu | cuda   (기본 cpu)
+//     detector: cpu | cuda | cuda-pageable   (기본 cpu; cuda=pinned)
 // 예:
 //   ./defect_pipeline /root/mvtec/capsule cpu  1 bench/cpu_baseline.csv
 //   ./defect_pipeline /root/mvtec/capsule cuda 10 bench/cuda.csv
@@ -36,9 +36,11 @@ int main(int argc, char** argv) {
     auto source = std::make_unique<MvtecFrameSource>(root, /*grayscale=*/true, loop_count);
 
     std::unique_ptr<IDefectDetector> detector;
-    if (det_kind == "cuda") {
+    if (det_kind == "cuda" || det_kind == "cuda-pageable") {
 #ifdef USE_CUDA
-        detector = std::make_unique<CudaDefectDetector>();
+        CudaDefectDetector::Params p;
+        p.pinned = (det_kind == "cuda");  // cuda-pageable = Phase 2 비교 경로
+        detector = std::make_unique<CudaDefectDetector>(p);
 #else
         std::cerr << "ERROR: built without CUDA (configure -DUSE_CUDA=ON)\n";
         return 1;

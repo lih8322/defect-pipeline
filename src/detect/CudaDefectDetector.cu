@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 // ───────────────────────── 유틸 ─────────────────────────
@@ -109,7 +110,11 @@ struct CudaDefectDetector::Impl {
     unsigned char *d_blur = nullptr, *d_bin = nullptr, *d_m1 = nullptr;
     float* d_tmp = nullptr;
 
-    // 타이밍 누적(전송 vs 연산 비중 측정 — Phase 3 동기부여 근거)
+    // Phase 3: pinned(page-locked) 호스트 staging 버퍼 + 전용 스트림.
+    unsigned char *h_in = nullptr, *h_out = nullptr;
+    cudaStream_t stream = nullptr;
+
+    // 타이밍 누적(전송 vs 연산 비중 측정)
     cudaEvent_t e0, e1, e2, e3;
     double ms_h2d = 0, ms_kernel = 0, ms_d2h = 0;
     long calls = 0;
@@ -117,19 +122,23 @@ struct CudaDefectDetector::Impl {
     Impl() {
         cudaEventCreate(&e0); cudaEventCreate(&e1);
         cudaEventCreate(&e2); cudaEventCreate(&e3);
+        cudaStreamCreate(&stream);
     }
     ~Impl() {
         free_buffers();
         cudaEventDestroy(e0); cudaEventDestroy(e1);
         cudaEventDestroy(e2); cudaEventDestroy(e3);
+        if (stream) cudaStreamDestroy(stream);
     }
 
     void free_buffers() {
         for (auto p : {d_in, d_ref, d_diff, d_blur, d_bin, d_m1})
             if (p) cudaFree(p);
         if (d_tmp) cudaFree(d_tmp);
+        if (h_in) cudaFreeHost(h_in);
+        if (h_out) cudaFreeHost(h_out);
         d_in = d_ref = d_diff = d_blur = d_bin = d_m1 = nullptr;
-        d_tmp = nullptr;
+        d_tmp = nullptr; h_in = h_out = nullptr;
     }
 
     void alloc(int width, int height) {
@@ -139,6 +148,10 @@ struct CudaDefectDetector::Impl {
         for (auto pp : {&d_in, &d_ref, &d_diff, &d_blur, &d_bin, &d_m1})
             CUDA_CHECK(cudaMalloc(pp, bytes));
         CUDA_CHECK(cudaMalloc(&d_tmp, bytes * sizeof(float)));
+        // pinned 호스트 버퍼: 드라이버의 숨은 staging 복사를 제거하고
+        // DMA가 직접 접근 → H2D/D2H 가속(및 async 전송 가능).
+        CUDA_CHECK(cudaHostAlloc(&h_in, bytes, cudaHostAllocDefault));
+        CUDA_CHECK(cudaHostAlloc(&h_out, bytes, cudaHostAllocDefault));
     }
 
     static void to_gray(const cv::Mat& in, cv::Mat& out) {
@@ -156,8 +169,9 @@ CudaDefectDetector::~CudaDefectDetector() {
     if (impl_ && impl_->calls > 0) {
         double c = double(impl_->calls);
         std::printf(
-            "[CUDA breakdown] per-frame avg: H2D %.3f ms | kernels %.3f ms | "
+            "[CUDA breakdown | %s] per-frame avg: H2D %.3f ms | kernels %.3f ms | "
             "D2H %.3f ms  (transfer %.1f%%)\n",
+            impl_->params.pinned ? "pinned" : "pageable",
             impl_->ms_h2d / c, impl_->ms_kernel / c, impl_->ms_d2h / c,
             100.0 * (impl_->ms_h2d + impl_->ms_d2h) /
                 (impl_->ms_h2d + impl_->ms_kernel + impl_->ms_d2h));
@@ -223,40 +237,52 @@ DetectionResult CudaDefectDetector::detect(const Frame& frame) {
     if (!gray.isContinuous()) gray = gray.clone();
 
     float t_h2d = 0, t_kernel = 0, t_d2h = 0;
+    const bool pinned = im.params.pinned;
+    cudaStream_t s = pinned ? im.stream : 0;  // pinned은 전용 스트림, pageable은 기본 스트림
 
-    // H2D
-    cudaEventRecord(im.e0);
-    CUDA_CHECK(cudaMemcpy(im.d_in, gray.data, size_t(im.n),
-                          cudaMemcpyHostToDevice));
-    cudaEventRecord(im.e1);
-
-    // 커널 파이프라인
     int n = im.n;
     int threads = 256;
     int blocks1d = (n + threads - 1) / threads;
     dim3 b2(16, 16);
     dim3 g2((im.w + b2.x - 1) / b2.x, (im.h + b2.y - 1) / b2.y);
 
-    k_absdiff<<<blocks1d, threads>>>(im.d_in, im.d_ref, im.d_diff, n);
-    k_blur_h<<<g2, b2>>>(im.d_diff, im.d_tmp, im.w, im.h);
-    k_blur_v<<<g2, b2>>>(im.d_tmp, im.d_blur, im.w, im.h);
-    k_threshold<<<blocks1d, threads>>>(
-        im.d_blur, im.d_bin, n,
-        (unsigned char)im.params.threshold, 255);
-    // open = erode → dilate
-    k_morph<<<g2, b2>>>(im.d_bin, im.d_m1, im.w, im.h, /*dilate=*/false);
-    k_morph<<<g2, b2>>>(im.d_m1, im.d_bin, im.w, im.h, /*dilate=*/true);
-    // close = dilate → erode
-    k_morph<<<g2, b2>>>(im.d_bin, im.d_m1, im.w, im.h, /*dilate=*/true);
-    k_morph<<<g2, b2>>>(im.d_m1, im.d_bin, im.w, im.h, /*dilate=*/false);
-    cudaEventRecord(im.e2);
-
-    // D2H
     cv::Mat bin(im.ref_size, CV_8UC1);
-    CUDA_CHECK(cudaMemcpy(bin.data, im.d_bin, size_t(im.n),
-                          cudaMemcpyDeviceToHost));
-    cudaEventRecord(im.e3);
+
+    // ── H2D ──
+    cudaEventRecord(im.e0, s);
+    if (pinned) {
+        std::memcpy(im.h_in, gray.data, size_t(n));  // pageable→pinned staging
+        CUDA_CHECK(cudaMemcpyAsync(im.d_in, im.h_in, size_t(n),
+                                   cudaMemcpyHostToDevice, s));
+    } else {
+        CUDA_CHECK(cudaMemcpy(im.d_in, gray.data, size_t(n),
+                              cudaMemcpyHostToDevice));  // 동기, pageable
+    }
+    cudaEventRecord(im.e1, s);
+
+    // ── 커널 파이프라인 (전부 스트림 s에서) ──
+    k_absdiff<<<blocks1d, threads, 0, s>>>(im.d_in, im.d_ref, im.d_diff, n);
+    k_blur_h<<<g2, b2, 0, s>>>(im.d_diff, im.d_tmp, im.w, im.h);
+    k_blur_v<<<g2, b2, 0, s>>>(im.d_tmp, im.d_blur, im.w, im.h);
+    k_threshold<<<blocks1d, threads, 0, s>>>(
+        im.d_blur, im.d_bin, n, (unsigned char)im.params.threshold, 255);
+    k_morph<<<g2, b2, 0, s>>>(im.d_bin, im.d_m1, im.w, im.h, /*dilate=*/false);
+    k_morph<<<g2, b2, 0, s>>>(im.d_m1, im.d_bin, im.w, im.h, /*dilate=*/true);
+    k_morph<<<g2, b2, 0, s>>>(im.d_bin, im.d_m1, im.w, im.h, /*dilate=*/true);
+    k_morph<<<g2, b2, 0, s>>>(im.d_m1, im.d_bin, im.w, im.h, /*dilate=*/false);
+    cudaEventRecord(im.e2, s);
+
+    // ── D2H ──
+    if (pinned) {
+        CUDA_CHECK(cudaMemcpyAsync(im.h_out, im.d_bin, size_t(n),
+                                   cudaMemcpyDeviceToHost, s));
+    } else {
+        CUDA_CHECK(cudaMemcpy(bin.data, im.d_bin, size_t(n),
+                              cudaMemcpyDeviceToHost));
+    }
+    cudaEventRecord(im.e3, s);
     CUDA_CHECK(cudaEventSynchronize(im.e3));
+    if (pinned) std::memcpy(bin.data, im.h_out, size_t(n));  // pinned→결과 Mat
 
     cudaEventElapsedTime(&t_h2d, im.e0, im.e1);
     cudaEventElapsedTime(&t_kernel, im.e1, im.e2);
@@ -280,4 +306,7 @@ DetectionResult CudaDefectDetector::detect(const Frame& frame) {
     return res;
 }
 
-std::string CudaDefectDetector::name() const { return "CudaDefectDetector"; }
+std::string CudaDefectDetector::name() const {
+    return impl_->params.pinned ? "CudaDefectDetector(pinned)"
+                                : "CudaDefectDetector(pageable)";
+}
