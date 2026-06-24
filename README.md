@@ -2,12 +2,12 @@
 
 MVTec AD 데이터셋을 "가상 카메라 스트림"으로 공급하여, 산업 표면 결함을 실시간 검출하는 end-to-end 파이프라인. CPU baseline → CUDA 가속 → 멀티스레드 비동기화 단계로 발전시키며 각 단계의 처리속도(ms/frame, FPS)를 정량 측정한다.
 
-## 현재 단계: Phase 1 — CPU baseline
+## 현재 단계: Phase 2 — CUDA 커널 포팅
 
 | Phase | 내용 | 상태 |
 |-------|------|------|
 | 1 | CPU 단일스레드 baseline (OpenCV) + 처리시간 측정 | ✅ |
-| 2 | CUDA 커널 포팅 (이진화·모폴로지·라벨링) | 예정 |
+| 2 | CUDA 커널 포팅 (absdiff·blur·threshold·morphology) | ✅ |
 | 3 | pinned memory + CUDA stream 비동기화 | 예정 |
 | 4 | grab/처리 스레드 분리 (lock-free 큐) | 예정 |
 
@@ -30,6 +30,30 @@ MVTec AD 데이터셋을 "가상 카메라 스트림"으로 공급하여, 산업
 
 > 현재 검출 파라미터(threshold/min_area)는 미튜닝 상태로 정상 이미지 오검출이 있다. 처리 **속도** baseline 확보가 Phase 1 목적이며, 검출 품질 튜닝은 후속 작업이다.
 
+## 측정 결과 — Phase 2 CUDA 포팅
+
+absdiff·가우시안 블러(분리형)·이진화·모폴로지(open/close)를 직접 작성한 CUDA 커널로 처리. 동기 `cudaMemcpy`(H2D/D2H), Connected Component Labeling은 CPU 유지. 동일 입력(1320 프레임)에서 측정.
+
+| 지표 | CPU baseline | **CUDA** | 향상 |
+|------|------|------|------|
+| mean | 3.42 ms | **1.90 ms** | **1.8×** |
+| p95 | 5.65 ms | 2.29 ms | 2.5× |
+| p99 | 6.52 ms | 2.50 ms | 2.6× |
+| throughput | 293 FPS | **525 FPS** | |
+| defect frames | 1250 | 1250 | 검출 결과 동일 |
+
+![CPU vs CUDA](docs/phase2_compare.png)
+
+**GPU 구간 분해** (프레임당 평균, CUDA event 측정):
+
+| H2D | 커널 | D2H | 전송 비중 |
+|-----|------|-----|-----------|
+| 0.131 ms | 0.224 ms | 0.142 ms | **54.9%** |
+
+→ 순수 GPU 구간은 ~0.50 ms뿐이고, detect() 1.90 ms의 나머지(~1.4 ms)는 **CPU 측 CCL·리사이즈**가 차지한다. 즉 병목이 픽셀 연산에서 *전송 + CPU 잔여 연산*으로 이동했다. 동기 전송이 GPU 구간의 절반 이상을 차지하므로 **Phase 3(pinned memory + CUDA stream 오버랩)**으로 직결되는 근거가 된다.
+
+> 설계: CUDA 검출기는 pImpl로 디바이스 자원/커널을 `.cu` 안에 숨겨, `main.cpp`(g++)와 커널(nvcc)을 분리 컴파일한다. 가우시안 가중치·모폴로지 SE는 constant memory에 둔다(전 스레드 동일 읽기 → 브로드캐스트 캐시). CMake `-DUSE_CUDA=OFF`로 CPU 전용 빌드도 가능.
+
 ## 설계 핵심
 
 - `IFrameSource` / `IDefectDetector` 인터페이스는 **프레임 경계에서만 호출**(프레임당 1회)되므로 가상 함수 비용이 무시 가능하다. 픽셀 단위 연산은 구현체 내부의 직선 루프에서 처리한다.
@@ -43,15 +67,19 @@ MVTec AD 데이터셋을 "가상 카메라 스트림"으로 공급하여, 산업
 
 ```bash
 mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
+cmake .. -DCMAKE_BUILD_TYPE=Release           # CUDA 포함 (기본 USE_CUDA=ON)
+# cmake .. -DUSE_CUDA=OFF                       # CPU 전용 (CUDA 없는 환경)
 make -j$(nproc)
 ```
+
+CUDA 빌드는 nvcc(아키텍처 sm_86 = RTX A5000/A4500 등 Ampere)를 사용한다.
 
 ## 실행
 
 ```bash
-# ./defect_pipeline <category_root> [loop_count] [out_csv]
-./defect_pipeline /root/mvtec/capsule 1 ../bench/cpu_baseline.csv
+# ./defect_pipeline <category_root> [detector=cpu|cuda] [loop_count] [out_csv]
+./defect_pipeline /root/mvtec/capsule cpu  10 ../bench/cpu_baseline.csv
+./defect_pipeline /root/mvtec/capsule cuda 10 ../bench/cuda.csv
 ```
 
 `loop_count`로 스트림을 반복해 벤치마크용 프레임 수를 늘릴 수 있다.

@@ -3,6 +3,9 @@
 #include "../core/IDefectDetector.hpp"
 #include "../capture/MvtecFrameSource.hpp"
 #include "../cpu/CpuDefectDetector.hpp"
+#ifdef USE_CUDA
+#include "../detect/CudaDefectDetector.hpp"
+#endif
 
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
@@ -12,23 +15,37 @@
 #include <string>
 
 // 사용법:
-//   ./defect_pipeline <mvtec_category_root> [loop_count] [out_csv]
+//   ./defect_pipeline <mvtec_category_root> [detector] [loop_count] [out_csv]
+//     detector: cpu | cuda   (기본 cpu)
 // 예:
-//   ./defect_pipeline /root/mvtec/capsule 1 bench/cpu_baseline.csv
+//   ./defect_pipeline /root/mvtec/capsule cpu  1 bench/cpu_baseline.csv
+//   ./defect_pipeline /root/mvtec/capsule cuda 10 bench/cuda.csv
 int main(int argc, char** argv) {
     if (argc < 2) {
         std::cerr << "Usage: " << argv[0]
-                  << " <mvtec_category_root> [loop_count] [out_csv]\n";
+                  << " <mvtec_category_root> [detector=cpu|cuda] [loop_count] [out_csv]\n";
         return 1;
     }
 
-    std::string root = argv[1];
-    int loop_count   = (argc >= 3) ? std::stoi(argv[2]) : 1;
-    std::string csv  = (argc >= 4) ? argv[3] : "";
+    std::string root     = argv[1];
+    std::string det_kind = (argc >= 3) ? argv[2] : "cpu";
+    int loop_count       = (argc >= 4) ? std::stoi(argv[3]) : 1;
+    std::string csv      = (argc >= 5) ? argv[4] : "";
 
     // --- 소스/검출기 구성 (인터페이스로 추상화) ---
     auto source = std::make_unique<MvtecFrameSource>(root, /*grayscale=*/true, loop_count);
-    auto detector = std::make_unique<CpuDefectDetector>();
+
+    std::unique_ptr<IDefectDetector> detector;
+    if (det_kind == "cuda") {
+#ifdef USE_CUDA
+        detector = std::make_unique<CudaDefectDetector>();
+#else
+        std::cerr << "ERROR: built without CUDA (configure -DUSE_CUDA=ON)\n";
+        return 1;
+#endif
+    } else {
+        detector = std::make_unique<CpuDefectDetector>();
+    }
 
     std::cout << "Source:   " << source->name() << "\n";
     std::cout << "Detector: " << detector->name() << "\n";
