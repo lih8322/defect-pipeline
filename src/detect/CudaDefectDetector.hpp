@@ -1,5 +1,6 @@
 #pragma once
 #include "../core/IDefectDetector.hpp"
+#include <cstdint>
 
 // CUDA 가속 결함 검출기 (Phase 2 — naive 포팅).
 //
@@ -35,6 +36,13 @@ public:
     void train(const std::vector<cv::Mat>& normal_images) override;
     DetectionResult detect(const Frame& frame) override;
     std::string name() const override;
+
+    // Phase 4 파이프라인용으로 detect()를 두 스테이지로 분리 노출.
+    //  - run_gpu_stage(): H2D→커널→D2H, 이진 결함 마스크(host)만 반환. GPU 워커 스레드 전용.
+    //  - label_mask(): 마스크에 CPU Connected Component Labeling → DetectionResult. CPU 워커 전용.
+    // 두 스테이지를 서로 다른 프레임에 대해 동시 실행하면 처리량이 max(GPU, CPU)로 결정된다.
+    cv::Mat run_gpu_stage(const Frame& frame);
+    DetectionResult label_mask(const cv::Mat& mask, std::uint64_t frame_index) const;
 
 private:
     struct Impl;   // CUDA 자원/커널 호출을 숨기는 pImpl

@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -224,11 +225,10 @@ void CudaDefectDetector::train(const std::vector<cv::Mat>& normal_images) {
     im.trained = true;
 }
 
-DetectionResult CudaDefectDetector::detect(const Frame& frame) {
+// ── GPU 스테이지: H2D → 커널 → D2H, 이진 마스크(host) 반환 ──
+cv::Mat CudaDefectDetector::run_gpu_stage(const Frame& frame) {
     auto& im = *impl_;
-    DetectionResult res;
-    res.frame_index = frame.index;
-    if (frame.image.empty() || !im.trained) return res;
+    if (frame.image.empty() || !im.trained) return cv::Mat();
 
     // 입력 그레이스케일·리사이즈는 CPU(프레임당 1회, 핫패스 아님).
     cv::Mat gray;
@@ -290,20 +290,35 @@ DetectionResult CudaDefectDetector::detect(const Frame& frame) {
     im.ms_h2d += t_h2d; im.ms_kernel += t_kernel; im.ms_d2h += t_d2h;
     ++im.calls;
 
-    // Connected Component Labeling은 CPU 유지(Phase 2 범위).
+    return bin;
+}
+
+// ── CPU 스테이지: Connected Component Labeling → DetectionResult ──
+DetectionResult CudaDefectDetector::label_mask(const cv::Mat& mask,
+                                               std::uint64_t frame_index) const {
+    DetectionResult res;
+    res.frame_index = frame_index;
+    if (mask.empty()) return res;
+
     cv::Mat labels, stats, centroids;
-    int ncomp = cv::connectedComponentsWithStats(bin, labels, stats, centroids, 8);
+    int ncomp = cv::connectedComponentsWithStats(mask, labels, stats, centroids, 8);
     for (int i = 1; i < ncomp; ++i) {
         int area = stats.at<int>(i, cv::CC_STAT_AREA);
-        if (area < im.params.min_area) continue;
+        if (area < impl_->params.min_area) continue;
         res.defects.emplace_back(stats.at<int>(i, cv::CC_STAT_LEFT),
                                  stats.at<int>(i, cv::CC_STAT_TOP),
                                  stats.at<int>(i, cv::CC_STAT_WIDTH),
                                  stats.at<int>(i, cv::CC_STAT_HEIGHT));
     }
-    res.mask = bin;
+    res.mask = mask;
     res.has_defect = !res.defects.empty();
     return res;
+}
+
+// 직렬 detect(): 두 스테이지를 한 스레드에서 순차 실행(기존 동작 유지).
+DetectionResult CudaDefectDetector::detect(const Frame& frame) {
+    cv::Mat mask = run_gpu_stage(frame);
+    return label_mask(mask, frame.index);
 }
 
 std::string CudaDefectDetector::name() const {
